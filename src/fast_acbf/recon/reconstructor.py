@@ -37,8 +37,9 @@ _VALID_FOV = ('original', 'full')
 class _ConstFFTProvider:
     """Serves a single precomputed FFT for every detector pixel.
 
-    Used to build the zero_insert reweighting map: run the same reconstruction
-    operator over a constant (ones-derived) input to measure per-pixel coverage.
+    Used to build the sparse-upscale reweighting map (zero_insert / gaussian_kde / lanczos_kde):
+    run the same reconstruction operator over a constant (ones-derived) input to
+    measure per-pixel coverage.
     """
 
     def __init__(self, fft_single: torch.Tensor) -> None:
@@ -254,7 +255,7 @@ class BFReconstructor:
                 raise ValueError(
                     "upscale_method='zero_insert' is not supported for acBF reconstruction "
                     "because the phase-alignment transfer function is not sparse-grid compatible. "
-                    "Use upscale_method='nearest' or 'bilinear' instead."
+                    "Use upscale_method='gaussian_kde', 'lanczos_kde', 'nearest', or 'bilinear' instead."
                 )
             rolloff = kwargs.get('rolloff', 0)
             chunk_size = kwargs.get('chunk_size', 64)
@@ -282,12 +283,14 @@ class BFReconstructor:
         else:
             raise ValueError(f"Unsupported mode {mode!r}. Choose 'tcBF' or 'acBF'.")
 
-        # zero_insert reweighting — normalize for non-uniform sub-pixel coverage (tcBF only)
+        # Sparse-upscale reweighting — normalize for non-uniform sub-pixel coverage (tcBF only).
+        # Applied to zero_insert, gaussian_kde, and lanczos_kde; the weight map is ~1 in the
+        # interior and <1 at the tapered edges.
         if mode_key == 'tcbf':
             extractor = self.imagefft.extractor
             if (
                 hasattr(extractor, 'upscale_method')
-                and extractor.upscale_method == 'zero_insert'
+                and extractor.upscale_method in ('zero_insert', 'gaussian_kde', 'lanczos_kde')
                 and extractor.upscale != 1.0
             ):
                 ones_provider = _ConstFFTProvider(extractor.make_ones_fft(self.device))

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from fast_acbf.data.bf_extractor import BFExtractor
-from fast_acbf.data.bf_preparer import BFPreparer, _check_zero_insert_compat, _prepared_shapes
+from fast_acbf.data.bf_preparer import BFPreparer, _check_integer_upscale_compat, _prepared_shapes
 from fast_acbf.data.imagefft import ImageFFT
 
 if TYPE_CHECKING:
@@ -59,6 +59,8 @@ class PipelineManager:
         pad_width: int | None = None,
         upscale: float = 1.0,
         upscale_method: str = 'zero_insert',
+        upscale_sigma: float | None = None,
+        lanczos_size: int | None = None,
     ) -> None:
         self.dataset = dataset
         self.detector_geom = detector_geom
@@ -76,9 +78,17 @@ class PipelineManager:
         self.ram_margin = float(ram_margin)
         self.upscale = 1.0
         self.upscale_method = 'bilinear'
+        self.upscale_sigma = None
+        self.lanczos_size = None
         self.pad_width = None
         self._effective_scan_shape = dataset.scan_shape
-        self.set_preparation(upscale=upscale, upscale_method=upscale_method, pad_width=pad_width)
+        self.set_preparation(
+            upscale=upscale,
+            upscale_method=upscale_method,
+            pad_width=pad_width,
+            upscale_sigma=upscale_sigma,
+            lanczos_size=lanczos_size,
+        )
 
         self.resolution = self._resolve()
         self.extractor: BFExtractor | None = None
@@ -91,12 +101,16 @@ class PipelineManager:
         upscale: float,
         upscale_method: str,
         pad_width: int | None,
+        upscale_sigma: float | None = None,
+        lanczos_size: int | None = None,
     ) -> None:
         if pad_width is not None and int(pad_width) < 0:
             raise ValueError(f"pad_width must be non-negative, got {pad_width}.")
-        _check_zero_insert_compat(str(upscale_method).strip().lower(), float(upscale))
+        _check_integer_upscale_compat(str(upscale_method).strip().lower(), float(upscale))
         self.upscale = float(upscale)
         self.upscale_method = str(upscale_method).strip().lower()
+        self.upscale_sigma = None if upscale_sigma is None else float(upscale_sigma)
+        self.lanczos_size = None if lanczos_size is None else int(lanczos_size)
         self.pad_width = int(pad_width) if (pad_width is not None and int(pad_width) > 0) else None
         _, padded_shape, _, _, _ = _prepared_shapes(
             self.dataset.scan_shape, self.upscale, self.pad_width
@@ -135,6 +149,8 @@ class PipelineManager:
             upscale=self.upscale,
             upscale_method=self.upscale_method,
             pad_width=self.pad_width,
+            upscale_sigma=self.upscale_sigma,
+            lanczos_size=self.lanczos_size,
         )
         self.imagefft = ImageFFT(
             self.preparer,
@@ -151,11 +167,15 @@ class PipelineManager:
         upscale: float,
         upscale_method: str,
         pad_width: int | None,
+        upscale_sigma: float | None = None,
+        lanczos_size: int | None = None,
     ) -> tuple[BFPreparer, ImageFFT]:
         self.set_preparation(
             upscale=upscale,
             upscale_method=upscale_method,
             pad_width=pad_width,
+            upscale_sigma=upscale_sigma,
+            lanczos_size=lanczos_size,
         )
         self.resolution = self._resolve()
         return self.build_full_pipeline()

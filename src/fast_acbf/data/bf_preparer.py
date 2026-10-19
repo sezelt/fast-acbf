@@ -13,7 +13,26 @@ if TYPE_CHECKING:
     from fast_acbf.data.bf_extractor import BFExtractor
 
 
-_VALID_UPSCALE_METHODS = ("nearest", "bilinear", "zero_insert")
+_VALID_UPSCALE_METHODS = ("nearest", "bilinear", "zero_insert", "gaussian_kde", "lanczos_kde")
+# Methods implemented via integer-stride zero-insertion; they require integer upscale.
+_INTEGER_ONLY_UPSCALE_METHODS = ("zero_insert", "gaussian_kde", "lanczos_kde")
+# KDE methods use kernel density estimation: a normalized kernel profile is placed
+# at each native pixel (zero-inserted on the stride-N grid) and the profiles are summed.
+_KDE_UPSCALE_METHODS = ("gaussian_kde", "lanczos_kde")
+# gaussian_kde kernel width as a multiple of the upscale factor N (in upscaled pixels).
+# sigma = N/2 makes each native pixel's Gaussian reach its neighbours at the grid stride.
+_GAUSSIAN_SIGMA_RATIO = 0.5
+# lanczos_kde default half-width a of the 1D profile sinc(x) * sinc(x/a) on [-a, a]
+# (upscaled pixels); r = a is the 1D kernel radius.
+_LANCZOS_DEFAULT_SIZE = 3
+# Gaussian truncation radius as a multiple of sigma for both KDE kernels.
+_SIGMA_TRUNC = 4.0
+# Cap on KDE convolution temporaries per sub-batch of detector pixels (bytes).
+# The KDE branch holds ~3 full upscaled-size temporaries per pixel (zero-inserted
+# extended input, convolution output, final crop copy), so a whole-stack call
+# (extract_all via device_mask precompute or vbf_images) is sub-batched to keep
+# the peak under this cap instead of scaling with the full stack.
+_KDE_TEMP_CAP_BYTES = 256 * 1024**2
 
 
 def _ceil_5smooth(n: int) -> int:
@@ -65,11 +84,55 @@ def _make_tukey_2d(
     return np.outer(wy, wx).astype(np.float32)
 
 
-def _check_zero_insert_compat(method: str, upscale: float) -> None:
-    """Raise before any state mutation if zero_insert is paired with a non-integer upscale."""
-    if method == "zero_insert" and abs(upscale - round(upscale)) > 1e-6:
+def _make_gaussian_kernel_2d(sigma: float) -> np.ndarray:
+    """Normalized separable 2D Gaussian kernel, truncated at 4 sigma.
+
+    Shape (2r+1, 2r+1), float32, sums to 1 so a constant image stays constant
+    everywhere once edge pixels are supplied (see _kde_native_pad).
+    """
+    r = max(1, int(np.ceil(_SIGMA_TRUNC * sigma)))
+    g = np.exp(-0.5 * (np.arange(-r, r + 1, dtype=np.float64) / sigma) ** 2)
+    k = np.outer(g, g)
+    return (k / k.sum()).astype(np.float32)
+
+
+def _make_lanczos_kernel_2d(size: int, upscale: int, sigma: float | None = None) -> np.ndarray:
+    """Normalized separable 2D Lanczos upsampling kernel (optionally Gaussian-smoothed).
+
+    The 1D profile on the upscaled grid is sinc(x/N) * sinc(x/(a*N)) on
+    [-a*N, a*N], where N = upscale and a = size: the standard Lanczos lowpass
+    that completes an N-fold zero-insertion, with cutoff at the baseband edge
+    (pi/N). A profile defined without the 1/N scaling would vanish at every
+    nonzero integer sample (sinc of an integer) and degenerate to the identity,
+    i.e. plain zero-insertion. If sigma is given, the profile is convolved with
+    a Gaussian of that sigma (truncated at 4 sigma) before outer-producting,
+    yielding a single combined kernel rather than a second filter pass. The
+    result sums to 1.
+    """
+    a = int(size)
+    if a < 1:
+        raise ValueError(f"lanczos_size must be a positive integer, got {size!r}.")
+    N = int(upscale)
+    r = a * N
+    x = np.arange(-r, r + 1, dtype=np.float64)
+    h = np.sinc(x / N) * np.sinc(x / r)
+    if sigma is not None:
+        if sigma <= 0:
+            raise ValueError(f"upscale_sigma must be positive, got {sigma!r}.")
+        rg = max(1, int(np.ceil(_SIGMA_TRUNC * sigma)))
+        y = np.arange(-rg, rg + 1, dtype=np.float64)
+        g = np.exp(-0.5 * (y / sigma) ** 2)
+        h = np.convolve(h, g, mode="full")
+        r += rg
+    k = np.outer(h, h)
+    return (k / k.sum()).astype(np.float32)
+
+
+def _check_integer_upscale_compat(method: str, upscale: float) -> None:
+    """Raise before any state mutation if an integer-only method gets a non-integer upscale."""
+    if method in _INTEGER_ONLY_UPSCALE_METHODS and abs(upscale - round(upscale)) > 1e-6:
         raise ValueError(
-            f"upscale_method='zero_insert' requires an integer upscale factor, "
+            f"upscale_method='{method}' requires an integer upscale factor, "
             f"got upscale={upscale!r}. Use 'nearest' or 'bilinear' for fractional upscale."
         )
 
@@ -142,11 +205,36 @@ class BFPreparer:
         upscale: float = 1.0,
         upscale_method: str = "zero_insert",
         pad_width: int | None = None,
+        upscale_sigma: float | None = None,
+        lanczos_size: int | None = None,
     ) -> None:
-        _check_zero_insert_compat(str(upscale_method).strip().lower(), float(upscale))
+        method = _normalize_upscale_method(upscale_method)
+        _check_integer_upscale_compat(method, float(upscale))
+        if upscale_sigma is not None:
+            upscale_sigma = float(upscale_sigma)
+            if upscale_sigma <= 0:
+                raise ValueError(f"upscale_sigma must be positive, got {upscale_sigma}.")
+            if method not in _KDE_UPSCALE_METHODS:
+                raise ValueError(
+                    f"upscale_sigma is only used with upscale_method='gaussian_kde' or "
+                    f"'lanczos_kde', got {method!r}."
+                )
+        if lanczos_size is not None:
+            if int(lanczos_size) != lanczos_size:
+                raise ValueError(f"lanczos_size must be an integer, got {lanczos_size!r}.")
+            lanczos_size = int(lanczos_size)
+            if lanczos_size < 1:
+                raise ValueError(f"lanczos_size must be a positive integer, got {lanczos_size}.")
+            if method != "lanczos_kde":
+                raise ValueError(
+                    f"lanczos_size is only used with upscale_method='lanczos_kde', "
+                    f"got {method!r}."
+                )
         self._extractor = extractor
         self.upscale = float(upscale)
-        self.upscale_method = _normalize_upscale_method(upscale_method)
+        self.upscale_method = method
+        self.upscale_sigma = upscale_sigma
+        self.lanczos_size = lanczos_size
         self.pad_width = None if pad_width is None or int(pad_width) == 0 else int(pad_width)
 
         self.raw_shape = tuple(extractor.scan_shape)
@@ -170,6 +258,43 @@ class BFPreparer:
             if self._has_pad
             else None
         )
+        if self.upscale_method in _KDE_UPSCALE_METHODS and self.upscaled_shape != self.raw_shape:
+            N = round(self.upscale)
+            if self.upscale_method == "gaussian_kde":
+                sigma = self.upscale_sigma if self.upscale_sigma is not None else _GAUSSIAN_SIGMA_RATIO * N
+                self._kde_kernel_np = _make_gaussian_kernel_2d(sigma)
+            else:
+                a = self.lanczos_size if self.lanczos_size is not None else _LANCZOS_DEFAULT_SIZE
+                self._kde_kernel_np = _make_lanczos_kernel_2d(a, N, self.upscale_sigma)
+            # 1D profile for the separable two-pass convolution. The 2D kernel is a
+            # normalized outer product k = g g^T / S, so with a = k[mid, :] / sqrt(k[mid, mid])
+            # (= g / sqrt(S)) one has a @ a^T == k: running a K x 1 conv then a 1 x K conv
+            # is mathematically identical to the 2D conv, but oneDNN's 2D conv2d
+            # materializes a K^2 x image-size im2col workspace while 1D passes do not.
+            k = self._kde_kernel_np
+            mid = k.shape[0] // 2
+            self._kde_profile_np = k[mid, :] / np.sqrt(k[mid, mid])
+            # Native pixels of reflect-extended border needed so the kernel reaches
+            # edge pixels completely (see _upsample); at least 1 for odd kernels.
+            self._kde_native_pad = max(1, int(np.ceil(self._kde_kernel_np.shape[-1] // 2 / N)))
+            # Coverage pattern: the upsampled ones field, normalized to mean 1. Because
+            # the reflect extension keeps every kernel fully supported, it is a uniform
+            # period-N residue-class modulation: each output pixel receives the same
+            # residue-class weight sum regardless of position. Dividing every upsampled
+            # image by it (in _upsample) cancels that modulation -- the pix_count
+            # divisive normalization of lanczos_kernel_density_estimate -- so a flat
+            # field upsamples to a flat 1/N^2 field instead of carrying a period-N grid
+            # into the reconstructions, at exactly the current output scale.
+            # (Set to None first so the _upsample call below skips the division.)
+            self._kde_ones_up_np = None
+            ones_up = self._upsample(np.ones((1, *self.raw_shape), dtype=np.float32))[0]
+            if ones_up.min() > 0:
+                self._kde_ones_up_np = ones_up / ones_up.mean()
+        else:
+            self._kde_kernel_np = None
+            self._kde_profile_np = None
+            self._kde_native_pad = 0
+            self._kde_ones_up_np = None
 
     # Duck-typed ImageFFT extractor interface
     @property
@@ -216,12 +341,66 @@ class BFPreparer:
 
         inp = src.to(device).unsqueeze(1)  # (Nb, 1, Ry, Rx)
         if self.upscale_method == "zero_insert":
-            # Insert zeros between native pixels — no convolution kernel applied.
-            # Values sit at [0, N, 2N, …, (Ry-1)*N]; trailing N-1 rows/cols are zero.
+            # Insert values at the stride-N grid positions — trailing N-1 rows/cols empty.
             N = round(self.upscale)
             Ry_up, Rx_up = self.upscaled_shape
             out = torch.zeros(inp.shape[0], 1, Ry_up, Rx_up, dtype=inp.dtype, device=inp.device)
             out[:, :, ::N, ::N] = inp
+        elif self.upscale_method in _KDE_UPSCALE_METHODS:
+            # KDE: each native pixel contributes a normalized kernel profile; summing
+            # them is a convolution of the zero-inserted image with the shared kernel.
+            # The kernel is symmetric, so correlation == convolution.
+            #
+            # The kernel is rank-1 (a normalized outer product), so the convolution
+            # runs as two 1D passes (K x 1, then 1 x K). This is mathematically
+            # identical, but it avoids the K^2 x image-size im2col workspace that
+            # oneDNN materializes for a 2D conv2d, which dominated peak memory.
+            #
+            # Zero-padding the convolution would truncate edge profiles, tapering the
+            # output near the borders (the source of the old edge band). Instead,
+            # reflect-extend the native data by p pixels per side so every kernel
+            # reaching the output footprint is fully supported, then crop back.
+            #
+            # Detector pixels are processed in sub-batches so the per-call temporaries
+            # (~3 full upscaled-size images each) stay bounded regardless of stack
+            # size — e.g. a whole-stack extract_all on the device_mask precompute path
+            # or the vbf_images property.
+            #
+            # Each result is divided by the cached coverage pattern (see __init__) to
+            # remove the period-N residue-class modulation the sum-of-kernels
+            # construction leaves in every upsampled image.
+            N = round(self.upscale)
+            p = self._kde_native_pad
+            Ry, Rx = inp.shape[-2], inp.shape[-1]
+            Ry_up, Rx_up = self.upscaled_shape
+            mode = "reflect" if p < min(Ry, Rx) else "replicate"
+            prof = torch.as_tensor(self._kde_profile_np, dtype=inp.dtype, device=inp.device)
+            ones = (
+                torch.as_tensor(self._kde_ones_up_np, dtype=inp.dtype, device=inp.device)
+                if self._kde_ones_up_np is not None
+                else None
+            )
+            r = prof.numel() // 2
+            out = torch.empty(inp.shape[0], 1, Ry_up, Rx_up, dtype=inp.dtype, device=inp.device)
+            Ry_ext, Rx_ext = (Ry + 2 * p) * N, (Rx + 2 * p) * N
+            # Temp bytes per detector pixel: zero-inserted extended input + the two
+            # 1D-pass outputs (each Ry_ext x Rx_ext) plus the final crop copy
+            # (Ry_up x Rx_up), float32.
+            per_px = (2 * Ry_ext * Rx_ext + Ry_up * Rx_up) * 4
+            bs = max(1, _KDE_TEMP_CAP_BYTES // max(1, per_px))
+            for b0 in range(0, inp.shape[0], bs):
+                b1 = min(b0 + bs, inp.shape[0])
+                seg = inp[b0:b1]
+                ext = F.pad(seg, (p, p, p, p), mode=mode)  # (bs, 1, Ry+2p, Rx+2p)
+                zi = torch.zeros(b1 - b0, 1, Ry_ext, Rx_ext, dtype=inp.dtype, device=inp.device)
+                zi[:, :, ::N, ::N] = ext
+                zi = F.conv2d(zi, prof.view(1, 1, prof.numel(), 1), padding=(r, 0))
+                zi = F.conv2d(zi, prof.view(1, 1, 1, prof.numel()), padding=(0, r))
+                out[b0:b1] = zi[..., p * N: p * N + Ry_up, p * N: p * N + Rx_up]
+                if ones is not None:
+                    # Divisive coverage normalization (mean-1 pattern): removes the
+                    # period-N residue-class modulation, preserving the 1/N^2 scale.
+                    out[b0:b1].div_(ones)
         elif self.upscale_method == "nearest":
             out = F.interpolate(inp, size=self.upscaled_shape, mode="nearest")
         else:
@@ -237,11 +416,12 @@ class BFPreparer:
         return out.cpu().numpy().astype(np.float32, copy=False)
 
     def make_ones_fft(self, device: str) -> torch.Tensor:
-        """Return fft2 of a prepared ones vBF used to build the zero_insert reweighting map.
+        """Return fft2 of a prepared ones vBF used to build the upscale reweighting map.
 
         Runs a single all-ones image through the same _prepare pipeline (zero-insertion,
-        reflect-padding, Tukey windowing) so the resulting FFT accounts for all spatial
-        modulations. Returns shape (1, padded_Ry, padded_Rx) complex64 on `device`.
+        KDE convolution, reflect-padding, Tukey windowing) so the resulting FFT
+        accounts for all spatial modulations. Returns shape (1, padded_Ry, padded_Rx)
+        complex64 on `device`.
         """
         ones = np.ones((1, *self.raw_shape), dtype=np.float32)
         prepared = self._prepare(ones)  # (1, padded_Ry, padded_Rx)
@@ -269,7 +449,9 @@ class BFPreparer:
 
 __all__ = [
     "BFPreparer",
-    "_check_zero_insert_compat",
+    "_check_integer_upscale_compat",
     "_compute_pad_for_axis",
+    "_make_gaussian_kernel_2d",
+    "_make_lanczos_kernel_2d",
     "_prepared_shapes",
 ]

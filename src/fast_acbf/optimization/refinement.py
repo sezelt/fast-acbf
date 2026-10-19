@@ -78,6 +78,8 @@ def _build_roi_solver(solver, scan_roi):
         fov=solver.fov,
         upscale=solver.upscale,
         upscale_method=solver.upscale_method,
+        upscale_sigma=solver.upscale_sigma,
+        lanczos_size=solver.lanczos_size,
     )
 
 
