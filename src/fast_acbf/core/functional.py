@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -188,3 +190,64 @@ def generate_aberration_basis(max_order: int, order_keys: list, kX: torch.Tensor
             basis_list.append(term_radial * Y[m] / (n + 1) * multiplier)  # b
 
     return torch.stack(basis_list, dim=0)
+
+
+# ----------------------------------------------------------------------
+# Upscale support estimates
+# ----------------------------------------------------------------------
+
+
+def probe_patch_radius(defocus: float, max_alpha_mrad: float) -> float:
+    """Radius (Angstroms) of the object region imaged by one diffraction pattern.
+
+    In linearized BF each pattern is the FT of
+    ``O(x) |P(x - r_i)|² e^{iφ_P(x - r_i)}``, i.e. the object is weighted by
+    the probe intensity — a shadow image of the aperture patch — centered on
+    the scan point ``r_i``. Defocused by Δz, stationary phase shows the probe
+    is the geometric shadow of the aperture, a disk of radius ``α |Δz|`` with
+    Fresnel fringes of width ``sqrt(λ |Δz|)`` at its edge (neglected here).
+
+    The in-focus Airy contribution (``0.61 λ / α``) is deliberately omitted:
+    it is the diffraction-limited patch and does not grow with defocus, so
+    including it would only set a floor on the estimate.
+
+    Args:
+        defocus: Defocus distance in Angstroms (signed; |·| is taken).
+        max_alpha_mrad: Convergence semi-angle in mrad.
+
+    Returns:
+        Patch radius in Angstroms (zero at exactly Δz = 0).
+    """
+    return (max_alpha_mrad / 1000.0) * abs(defocus)
+
+
+def estimate_max_upscale(
+    defocus: float,
+    scan_step_size: float,
+    max_alpha_mrad: float,
+) -> float:
+    """Estimate the maximum upsampling supported by the scan data.
+
+    The enhanced resolution of tcBF/acBF relies on every diffraction pattern
+    imaging an object patch of radius :func:`probe_patch_radius` centered on
+    its scan point. On a square scan lattice with step ``δ`` the farthest
+    object point from any scan point is a cell corner at ``δ/√2``, so the
+    patches overlap everywhere in the image iff ``a_probe ≥ δ/√2``, giving
+    the maximum supported upsampling
+
+        N_max = √2 · a_probe / δ
+
+    (the 1-D analogue is ``a_probe / δ``).
+
+    Args:
+        defocus: Measured defocus distance in Angstroms
+            (e.g. ``AberrationState.get_physical('C_1_0')``).
+        scan_step_size: Raw scan step in Angstroms per pixel.
+        max_alpha_mrad: Convergence semi-angle in mrad.
+
+    Returns:
+        The 2-D coverage ratio as a float (e.g. ``8.8``); floor it for the
+        largest integer upscale that is fully supported.
+    """
+    a_probe = probe_patch_radius(defocus, max_alpha_mrad)
+    return math.sqrt(2.0) * a_probe / scan_step_size

@@ -27,11 +27,9 @@ _GAUSSIAN_SIGMA_RATIO = 0.5
 _LANCZOS_DEFAULT_SIZE = 3
 # Gaussian truncation radius as a multiple of sigma for both KDE kernels.
 _SIGMA_TRUNC = 4.0
-# Cap on KDE convolution temporaries per sub-batch of detector pixels (bytes).
-# The KDE branch holds ~3 full upscaled-size temporaries per pixel (zero-inserted
-# extended input, convolution output, final crop copy), so a whole-stack call
-# (extract_all via device_mask precompute or vbf_images) is sub-batched to keep
-# the peak under this cap instead of scaling with the full stack.
+# Cap on KDE convolution temporaries per sub-batch of detector pixels (bytes);
+# the KDE branch holds ~3 upscaled-size temporaries per pixel, so whole-stack
+# calls are sub-batched to keep peak memory bounded.
 _KDE_TEMP_CAP_BYTES = 256 * 1024**2
 
 
@@ -84,14 +82,39 @@ def _make_tukey_2d(
     return np.outer(wy, wx).astype(np.float32)
 
 
-def _make_gaussian_kernel_2d(sigma: float) -> np.ndarray:
-    """Normalized separable 2D Gaussian kernel, truncated at 4 sigma.
+def _upsampled_hat(N: int) -> np.ndarray:
+    """1-D upsampled hat (linear B-spline) kernel on the upscaled grid.
 
-    Shape (2r+1, 2r+1), float32, sums to 1 so a constant image stays constant
-    everywhere once edge pixels are supplied (see _kde_native_pad).
+    The triangle t[m] = 1 - |m|/N for |m| <= N (length 2N+1, sum N). Folded
+    into the KDE profile because:
+
+    * Its spectrum T̂(ω) = (1/N) sin²(πNω)/sin²(πω) is exactly 0 at every
+      fold point ω = k/N (k != 0), where the zero-inserted native spectrum
+      has its DC-replica spikes -- so the upsampled field has no period-N
+      structure in q (no comb peaks, no dark lines).
+    * N-shifted copies sum to exactly 1 (discrete partition of unity), so a
+      constant field upsamples to a constant.
+
+    Same kernel bilinear (F.interpolate) uses, which is why bilinear is
+    already comb-free.
     """
+    m = np.arange(-N, N + 1, dtype=np.float64)
+    return 1.0 - np.abs(m) / N
+
+
+def _make_gaussian_kernel_2d(sigma: float, upscale: int) -> np.ndarray:
+    """Normalized separable 2D KDE upscaling kernel.
+
+    A Gaussian of the given sigma (in upscaled pixels, truncated at 4 sigma)
+    folded with the upsampled hat :func:`_upsampled_hat` so that the kernel
+    spectrum has exact nulls at every fold point ω = k/N (k != 0), which
+    removes the zero-insertion comb from the upsampled field (see
+    _upsampled_hat). Shape (2r+1, 2r+1), float32, sums to 1.
+    """
+    N = int(upscale)
     r = max(1, int(np.ceil(_SIGMA_TRUNC * sigma)))
     g = np.exp(-0.5 * (np.arange(-r, r + 1, dtype=np.float64) / sigma) ** 2)
+    g = np.convolve(g, _upsampled_hat(N), mode="full")
     k = np.outer(g, g)
     return (k / k.sum()).astype(np.float32)
 
@@ -100,14 +123,15 @@ def _make_lanczos_kernel_2d(size: int, upscale: int, sigma: float | None = None)
     """Normalized separable 2D Lanczos upsampling kernel (optionally Gaussian-smoothed).
 
     The 1D profile on the upscaled grid is sinc(x/N) * sinc(x/(a*N)) on
-    [-a*N, a*N], where N = upscale and a = size: the standard Lanczos lowpass
-    that completes an N-fold zero-insertion, with cutoff at the baseband edge
-    (pi/N). A profile defined without the 1/N scaling would vanish at every
-    nonzero integer sample (sinc of an integer) and degenerate to the identity,
-    i.e. plain zero-insertion. If sigma is given, the profile is convolved with
-    a Gaussian of that sigma (truncated at 4 sigma) before outer-producting,
-    yielding a single combined kernel rather than a second filter pass. The
-    result sums to 1.
+    [-a*N, a*N] (N = upscale, a = size): the standard Lanczos lowpass that
+    completes an N-fold zero-insertion, with cutoff at the baseband edge
+    (pi/N). If sigma is given, the profile is first convolved with a Gaussian
+    of that sigma (truncated at 4 sigma), yielding a single combined kernel
+    rather than a second filter pass. Finally the profile is folded with the
+    upsampled hat (see :func:`_upsampled_hat`): plain Lanczos nulls its
+    spectrum at ω = ±k/N only for k ≠ 1, while the hat nulls at ALL nonzero
+    k/N, so the combined kernel removes the upsampled-vBF comb at every fold
+    point (support (a+1)N). The result sums to 1.
     """
     a = int(size)
     if a < 1:
@@ -124,6 +148,7 @@ def _make_lanczos_kernel_2d(size: int, upscale: int, sigma: float | None = None)
         g = np.exp(-0.5 * (y / sigma) ** 2)
         h = np.convolve(h, g, mode="full")
         r += rg
+    h = np.convolve(h, _upsampled_hat(N), mode="full")
     k = np.outer(h, h)
     return (k / k.sum()).astype(np.float32)
 
@@ -262,30 +287,28 @@ class BFPreparer:
             N = round(self.upscale)
             if self.upscale_method == "gaussian_kde":
                 sigma = self.upscale_sigma if self.upscale_sigma is not None else _GAUSSIAN_SIGMA_RATIO * N
-                self._kde_kernel_np = _make_gaussian_kernel_2d(sigma)
+                self._kde_kernel_np = _make_gaussian_kernel_2d(sigma, N)
             else:
                 a = self.lanczos_size if self.lanczos_size is not None else _LANCZOS_DEFAULT_SIZE
                 self._kde_kernel_np = _make_lanczos_kernel_2d(a, N, self.upscale_sigma)
-            # 1D profile for the separable two-pass convolution. The 2D kernel is a
-            # normalized outer product k = g g^T / S, so with a = k[mid, :] / sqrt(k[mid, mid])
-            # (= g / sqrt(S)) one has a @ a^T == k: running a K x 1 conv then a 1 x K conv
-            # is mathematically identical to the 2D conv, but oneDNN's 2D conv2d
-            # materializes a K^2 x image-size im2col workspace while 1D passes do not.
+            # 1D profile for the separable two-pass convolution: the 2D kernel is an
+            # outer product k = g g^T / S, so a = k[mid, :] / sqrt(k[mid, mid])
+            # satisfies a @ a^T == k (two 1D passes == the 2D conv), but the 1D
+            # passes avoid the K^2 x image-size im2col workspace oneDNN allocates
+            # for conv2d. a is scaled by N so its sum over N-shifts is exactly 1
+            # per pass (the zero-inserted field is nonzero only at the stride-N
+            # grid); without this, a flat field would be attenuated by 1/N^2.
             k = self._kde_kernel_np
             mid = k.shape[0] // 2
-            self._kde_profile_np = k[mid, :] / np.sqrt(k[mid, mid])
+            self._kde_profile_np = (k[mid, :] / np.sqrt(k[mid, mid])) * N
             # Native pixels of reflect-extended border needed so the kernel reaches
             # edge pixels completely (see _upsample); at least 1 for odd kernels.
             self._kde_native_pad = max(1, int(np.ceil(self._kde_kernel_np.shape[-1] // 2 / N)))
-            # Coverage pattern: the upsampled ones field, normalized to mean 1. Because
-            # the reflect extension keeps every kernel fully supported, it is a uniform
-            # period-N residue-class modulation: each output pixel receives the same
-            # residue-class weight sum regardless of position. Dividing every upsampled
-            # image by it (in _upsample) cancels that modulation -- the pix_count
-            # divisive normalization of lanczos_kernel_density_estimate -- so a flat
-            # field upsamples to a flat 1/N^2 field instead of carrying a period-N grid
-            # into the reconstructions, at exactly the current output scale.
-            # (Set to None first so the _upsample call below skips the division.)
+            # Coverage pattern: the upsampled ones field, normalized to mean 1.
+            # With the partition-of-unity profile the upsampled ones field is
+            # exactly 1 everywhere (border included), so the division in
+            # _upsample is a mathematical no-op, kept only as a float32-drift
+            # guard. (Set to None first so the _upsample call skips it.)
             self._kde_ones_up_np = None
             ones_up = self._upsample(np.ones((1, *self.raw_shape), dtype=np.float32))[0]
             if ones_up.min() > 0:
@@ -348,27 +371,19 @@ class BFPreparer:
             out[:, :, ::N, ::N] = inp
         elif self.upscale_method in _KDE_UPSCALE_METHODS:
             # KDE: each native pixel contributes a normalized kernel profile; summing
-            # them is a convolution of the zero-inserted image with the shared kernel.
-            # The kernel is symmetric, so correlation == convolution.
+            # them is a convolution of the zero-inserted image with the shared kernel
+            # (symmetric kernel, so correlation == convolution), run as two 1D passes
+            # (K x 1, then 1 x K) to avoid the K^2 im2col workspace of a 2D conv.
             #
-            # The kernel is rank-1 (a normalized outer product), so the convolution
-            # runs as two 1D passes (K x 1, then 1 x K). This is mathematically
-            # identical, but it avoids the K^2 x image-size im2col workspace that
-            # oneDNN materializes for a 2D conv2d, which dominated peak memory.
+            # The native data is reflect-extended by p pixels per side rather than
+            # zero-padded (which would truncate edge profiles and taper the border),
+            # so every kernel is fully supported; the output is cropped back.
             #
-            # Zero-padding the convolution would truncate edge profiles, tapering the
-            # output near the borders (the source of the old edge band). Instead,
-            # reflect-extend the native data by p pixels per side so every kernel
-            # reaching the output footprint is fully supported, then crop back.
+            # Pixels are processed in sub-batches so the per-call temporaries (~3
+            # upscaled-size images) stay bounded regardless of stack size.
             #
-            # Detector pixels are processed in sub-batches so the per-call temporaries
-            # (~3 full upscaled-size images each) stay bounded regardless of stack
-            # size — e.g. a whole-stack extract_all on the device_mask precompute path
-            # or the vbf_images property.
-            #
-            # Each result is divided by the cached coverage pattern (see __init__) to
-            # remove the period-N residue-class modulation the sum-of-kernels
-            # construction leaves in every upsampled image.
+            # Each result is divided by the cached coverage pattern (see __init__);
+            # a no-op in exact arithmetic, guarding float32 drift only.
             N = round(self.upscale)
             p = self._kde_native_pad
             Ry, Rx = inp.shape[-2], inp.shape[-1]
@@ -398,8 +413,8 @@ class BFPreparer:
                 zi = F.conv2d(zi, prof.view(1, 1, 1, prof.numel()), padding=(0, r))
                 out[b0:b1] = zi[..., p * N: p * N + Ry_up, p * N: p * N + Rx_up]
                 if ones is not None:
-                    # Divisive coverage normalization (mean-1 pattern): removes the
-                    # period-N residue-class modulation, preserving the 1/N^2 scale.
+                    # Divisive coverage normalization (mean-1 pattern); a no-op in
+                    # exact arithmetic, guarding float32 accumulation drift.
                     out[b0:b1].div_(ones)
         elif self.upscale_method == "nearest":
             out = F.interpolate(inp, size=self.upscaled_shape, mode="nearest")

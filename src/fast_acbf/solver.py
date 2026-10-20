@@ -17,7 +17,12 @@ from ptyrad.utils.image_proc import mfft2
 
 from fast_acbf.core.aberrations import AberrationState
 from fast_acbf.core.acbf import reconstruct_acbf_complex_inversion
-from fast_acbf.core.functional import generate_aberration_basis, generate_shift_basis, make_probe_from_chi
+from fast_acbf.core.functional import (
+    estimate_max_upscale,
+    generate_aberration_basis,
+    generate_shift_basis,
+    make_probe_from_chi,
+)
 from fast_acbf.data.dataset4d import Dataset4D
 from fast_acbf.data.bf_preparer import _normalize_upscale_method, _prepared_shapes
 from fast_acbf.data.geometry import CoordinateTransform, DetectorGeometry, ScanGeometry
@@ -252,6 +257,17 @@ class BFSolver:
         self._upscale_method = str(upscale_method).strip().lower()
         self._upscale_sigma = None if upscale_sigma is None else float(upscale_sigma)
         self._lanczos_size = None if lanczos_size is None else int(lanczos_size)
+        # Constructor-time preparation arguments. Explicit-argument
+        # reconstruction calls (get_tcBF/get_acBF/diagnostics/stack) resolve
+        # unspecified arguments against these, so they are pure functions of
+        # their own arguments and do not inherit state from earlier calls.
+        self._init_upscale = self._upscale
+        self._init_upscale_method = self._upscale_method
+        self._init_upscale_sigma = self._upscale_sigma
+        self._init_lanczos_size = self._lanczos_size
+        self._init_pad_width = (
+            None if (pad_width is None or int(pad_width) <= 0) else int(pad_width)
+        )
         self._fov = str(fov)
         self._active_prep_key = _make_prep_key(
             self._raw_scan_shape,
@@ -402,6 +418,23 @@ class BFSolver:
             raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
         return self._raw_scan_step_size / u
 
+    def estimate_max_upscale(self) -> float:
+        """Maximum upsampling supported by the measured defocus and scan step.
+
+        Each diffraction pattern images an object patch of radius
+        ``α |Δz|`` (the geometric shadow of the aperture); on the square scan
+        lattice the patches overlap everywhere in the image iff that radius
+        reaches the cell corners at ``δ/√2``. Returns the (non-integer) 2-D
+        ratio ``√2 · a_probe / δ`` — floor it for the largest integer upscale.
+        Uses the currently measured defocus ``C_1_0`` (run
+        :meth:`refine_defocus` first for a better estimate).
+        """
+        return estimate_max_upscale(
+            defocus=self.ab_state.get_physical("C_1_0"),
+            scan_step_size=self._raw_scan_step_size,
+            max_alpha_mrad=self.max_alpha,
+        )
+
     @property
     def pipeline(self) -> str:
         return self._pipeline_manager.resolution.pipeline
@@ -474,6 +507,59 @@ class BFSolver:
     def set_upscale(self, value: float) -> BFSolver:
         return self.prepare_vbf(upscale=value)
 
+    def _resolve_prep_args(
+        self,
+        *,
+        upscale,
+        upscale_method,
+        pad_width,
+        upscale_sigma,
+        lanczos_size,
+    ) -> dict:
+        """Resolve a partial preparation request into fully-specified values.
+
+        Used by the explicit-argument reconstruction entry points so they are
+        pure functions of (constructor config, call kwargs): unspecified
+        arguments fall back to the constructor-time values instead of the
+        currently active state, so a previous call's ``upscale_sigma`` or
+        ``lanczos_size`` can never leak into a later call. Method-specific
+        arguments additionally reset to their defaults (``None``) when the
+        resolved method differs from the constructor method, since e.g. a
+        ``lanczos_size`` is invalid for ``gaussian_kde``.
+
+        ``pad_width`` must be ``_PREP_SENTINEL`` when the caller did not pass
+        one, so "unspecified" can be distinguished from ``None`` (no padding).
+        """
+        new_upscale = float(upscale) if upscale is not None else self._init_upscale
+        new_method = (
+            str(upscale_method).strip().lower()
+            if upscale_method is not None
+            else self._init_upscale_method
+        )
+        if pad_width is _PREP_SENTINEL:
+            new_pad_width = self._init_pad_width
+        else:
+            new_pad_width = (
+                None if (pad_width is None or int(pad_width) <= 0) else int(pad_width)
+            )
+        if new_method == self._init_upscale_method:
+            new_upscale_sigma = (
+                self._init_upscale_sigma if upscale_sigma is None else float(upscale_sigma)
+            )
+            new_lanczos_size = (
+                self._init_lanczos_size if lanczos_size is None else int(lanczos_size)
+            )
+        else:
+            new_upscale_sigma = None if upscale_sigma is None else float(upscale_sigma)
+            new_lanczos_size = None if lanczos_size is None else int(lanczos_size)
+        return dict(
+            upscale=new_upscale,
+            upscale_method=new_method,
+            pad_width=new_pad_width,
+            upscale_sigma=new_upscale_sigma,
+            lanczos_size=new_lanczos_size,
+        )
+
     def prepare_vbf(
         self,
         *,
@@ -483,7 +569,13 @@ class BFSolver:
         upscale_sigma: float | None = None,
         lanczos_size: int | None = None,
     ) -> BFSolver:
-        """Switch the active prepared vBF grid, rebuilding ImageFFT when needed."""
+        """Switch the active prepared vBF grid, rebuilding ImageFFT when needed.
+
+        Incremental setter: ``None`` arguments keep the currently active value.
+        The explicit-argument reconstruction entry points do not want that
+        merge (a resolved ``None`` means "use the default"), so they call
+        :meth:`_apply_preparation` directly with fully resolved values.
+        """
         new_upscale = float(upscale) if upscale is not None else self._upscale
         new_method = (
             str(upscale_method).strip().lower()
@@ -499,28 +591,45 @@ class BFSolver:
         new_lanczos_size = (
             self._lanczos_size if lanczos_size is None else int(lanczos_size)
         )
-
-        new_key = _make_prep_key(
-            self._raw_scan_shape,
-            new_upscale,
-            new_method,
-            new_pad_width,
-            new_upscale_sigma,
-            new_lanczos_size,
-        )
-        if new_key == self._active_prep_key:
-            return self
-
-        preparer, imagefft = self._pipeline_manager.rebuild_prepared_pipeline(
+        return self._apply_preparation(
             upscale=new_upscale,
             upscale_method=new_method,
             pad_width=new_pad_width,
             upscale_sigma=new_upscale_sigma,
             lanczos_size=new_lanczos_size,
         )
+
+    def _apply_preparation(
+        self,
+        *,
+        upscale: float,
+        upscale_method: str,
+        pad_width: int | None,
+        upscale_sigma: float | None,
+        lanczos_size: int | None,
+    ) -> BFSolver:
+        """Apply a fully-resolved preparation without merging against current state."""
+        new_key = _make_prep_key(
+            self._raw_scan_shape,
+            upscale,
+            upscale_method,
+            pad_width,
+            upscale_sigma,
+            lanczos_size,
+        )
+        if new_key == self._active_prep_key:
+            return self
+
+        preparer, imagefft = self._pipeline_manager.rebuild_prepared_pipeline(
+            upscale=upscale,
+            upscale_method=upscale_method,
+            pad_width=pad_width,
+            upscale_sigma=upscale_sigma,
+            lanczos_size=lanczos_size,
+        )
         scan_geom = ScanGeometry.from_params(
             preparer.padded_shape,
-            self._raw_scan_step_size / new_upscale,
+            self._raw_scan_step_size / upscale,
             device=self.device,
         )
         self._recon.replace_prepared_data(
@@ -529,10 +638,10 @@ class BFSolver:
             crop_shape=preparer.upscaled_shape if preparer._has_pad else None,
             pad_offsets=preparer.pad_offsets if preparer._has_pad else None,
         )
-        self._upscale = new_upscale
-        self._upscale_method = new_method
-        self._upscale_sigma = new_upscale_sigma
-        self._lanczos_size = new_lanczos_size
+        self._upscale = upscale
+        self._upscale_method = upscale_method
+        self._upscale_sigma = upscale_sigma
+        self._lanczos_size = lanczos_size
         self._active_prep_key = new_key
         self.reconstructed_image = None
         return self
@@ -570,7 +679,15 @@ class BFSolver:
             if key in kwargs:
                 prep_kwargs[key] = kwargs.pop(key)
         if prep_kwargs:
-            self.prepare_vbf(**prep_kwargs)
+            self._apply_preparation(
+                **self._resolve_prep_args(
+                    upscale=prep_kwargs.get('upscale'),
+                    upscale_method=prep_kwargs.get('upscale_method'),
+                    pad_width=prep_kwargs.get('pad_width', _PREP_SENTINEL),
+                    upscale_sigma=prep_kwargs.get('upscale_sigma'),
+                    lanczos_size=prep_kwargs.get('lanczos_size'),
+                )
+            )
         return self._recon.reconstruct(mode=mode, requires_grad=requires_grad, **kwargs)
 
     def _build_c10_stack_axis(
@@ -718,9 +835,12 @@ class BFSolver:
             or upscale_sigma is not None
             or lanczos_size is not None
         ):
-            self.prepare_vbf(
-                upscale=upscale, upscale_method=upscale_method, pad_width=pad_width,
-                upscale_sigma=upscale_sigma, lanczos_size=lanczos_size,
+            self._apply_preparation(
+                **self._resolve_prep_args(
+                    upscale=upscale, upscale_method=upscale_method,
+                    pad_width=pad_width, upscale_sigma=upscale_sigma,
+                    lanczos_size=lanczos_size,
+                )
             )
         img = self.reconstruct(mode=mode.lower(), requires_grad=False, fov=f, **kwargs)
         self.reconstructed_image = img.detach()
@@ -767,9 +887,12 @@ class BFSolver:
             or upscale_sigma is not None
             or lanczos_size is not None
         ):
-            self.prepare_vbf(
-                upscale=upscale, upscale_method=upscale_method, pad_width=pad_width,
-                upscale_sigma=upscale_sigma, lanczos_size=lanczos_size,
+            self._apply_preparation(
+                **self._resolve_prep_args(
+                    upscale=upscale, upscale_method=upscale_method,
+                    pad_width=pad_width, upscale_sigma=upscale_sigma,
+                    lanczos_size=lanczos_size,
+                )
             )
         f = fov if fov is not None else self._fov
         if f not in _VALID_FOV:
@@ -823,9 +946,12 @@ class BFSolver:
             or upscale_sigma is not None
             or lanczos_size is not None
         ):
-            self.prepare_vbf(
-                upscale=upscale, upscale_method=upscale_method, pad_width=pad_width,
-                upscale_sigma=upscale_sigma, lanczos_size=lanczos_size,
+            self._apply_preparation(
+                **self._resolve_prep_args(
+                    upscale=upscale, upscale_method=upscale_method,
+                    pad_width=pad_width, upscale_sigma=upscale_sigma,
+                    lanczos_size=lanczos_size,
+                )
             )
         f = fov if fov is not None else self._fov
         c10_axis = self._build_c10_stack_axis(
