@@ -27,9 +27,9 @@ _GAUSSIAN_SIGMA_RATIO = 0.5
 _LANCZOS_DEFAULT_SIZE = 3
 # Gaussian truncation radius as a multiple of sigma for both KDE kernels.
 _SIGMA_TRUNC = 4.0
-# Cap on KDE convolution temporaries per sub-batch of detector pixels (bytes);
-# the KDE branch holds ~3 upscaled-size temporaries per pixel, so whole-stack
-# calls are sub-batched to keep peak memory bounded.
+# Cap on per-sub-batch upsampling temporaries (bytes) for the interpolating
+# methods; the KDE passes hold a few upscaled-size temporaries per detector
+# pixel, so whole-stack calls are sub-batched to keep peak memory bounded.
 _KDE_TEMP_CAP_BYTES = 256 * 1024**2
 
 
@@ -304,20 +304,10 @@ class BFPreparer:
             # Native pixels of reflect-extended border needed so the kernel reaches
             # edge pixels completely (see _upsample); at least 1 for odd kernels.
             self._kde_native_pad = max(1, int(np.ceil(self._kde_kernel_np.shape[-1] // 2 / N)))
-            # Coverage pattern: the upsampled ones field, normalized to mean 1.
-            # With the partition-of-unity profile the upsampled ones field is
-            # exactly 1 everywhere (border included), so the division in
-            # _upsample is a mathematical no-op, kept only as a float32-drift
-            # guard. (Set to None first so the _upsample call skips it.)
-            self._kde_ones_up_np = None
-            ones_up = self._upsample(np.ones((1, *self.raw_shape), dtype=np.float32))[0]
-            if ones_up.min() > 0:
-                self._kde_ones_up_np = ones_up / ones_up.mean()
         else:
             self._kde_kernel_np = None
             self._kde_profile_np = None
             self._kde_native_pad = 0
-            self._kde_ones_up_np = None
 
     # Duck-typed ImageFFT extractor interface
     @property
@@ -382,19 +372,17 @@ class BFPreparer:
             # Pixels are processed in sub-batches so the per-call temporaries (~3
             # upscaled-size images) stay bounded regardless of stack size.
             #
-            # Each result is divided by the cached coverage pattern (see __init__);
-            # a no-op in exact arithmetic, guarding float32 drift only.
+            # No per-image coverage normalization here: the defocus shifts place
+            # real information between the native scan sites, so each image is
+            # only a partial view of the upscaled grid. The ones-field
+            # normalization of the per-pixel coverage is applied to the final
+            # reconstruction instead (see BFReconstructor).
             N = round(self.upscale)
             p = self._kde_native_pad
             Ry, Rx = inp.shape[-2], inp.shape[-1]
             Ry_up, Rx_up = self.upscaled_shape
             mode = "reflect" if p < min(Ry, Rx) else "replicate"
             prof = torch.as_tensor(self._kde_profile_np, dtype=inp.dtype, device=inp.device)
-            ones = (
-                torch.as_tensor(self._kde_ones_up_np, dtype=inp.dtype, device=inp.device)
-                if self._kde_ones_up_np is not None
-                else None
-            )
             r = prof.numel() // 2
             out = torch.empty(inp.shape[0], 1, Ry_up, Rx_up, dtype=inp.dtype, device=inp.device)
             Ry_ext, Rx_ext = (Ry + 2 * p) * N, (Rx + 2 * p) * N
@@ -412,10 +400,6 @@ class BFPreparer:
                 zi = F.conv2d(zi, prof.view(1, 1, prof.numel(), 1), padding=(r, 0))
                 zi = F.conv2d(zi, prof.view(1, 1, 1, prof.numel()), padding=(0, r))
                 out[b0:b1] = zi[..., p * N: p * N + Ry_up, p * N: p * N + Rx_up]
-                if ones is not None:
-                    # Divisive coverage normalization (mean-1 pattern); a no-op in
-                    # exact arithmetic, guarding float32 accumulation drift.
-                    out[b0:b1].div_(ones)
         elif self.upscale_method == "nearest":
             out = F.interpolate(inp, size=self.upscaled_shape, mode="nearest")
         else:

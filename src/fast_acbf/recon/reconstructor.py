@@ -283,9 +283,13 @@ class BFReconstructor:
         else:
             raise ValueError(f"Unsupported mode {mode!r}. Choose 'tcBF' or 'acBF'.")
 
-        # Sparse-upscale reweighting — normalize for non-uniform sub-pixel coverage (tcBF only).
-        # Applied to zero_insert, gaussian_kde, and lanczos_kde; the weight map is ~1 in the
-        # interior and <1 at the tapered edges.
+        # Sparse-upscale reweighting — divide by the per-pixel coverage measured
+        # by running the same operator on the prepared ones field (tcBF only).
+        # For zero_insert that is the count of images covering each pixel; for
+        # the KDE methods the coverage is uniform (partition-of-unity kernels),
+        # so it is a global scale plus the Tukey edge taper when padded.
+        # acBF is excluded: its transfer function vanishes at DC, so the
+        # ones-field weight map is ~0 and the division is ill-conditioned.
         if mode_key == 'tcbf':
             extractor = self.imagefft.extractor
             if (
